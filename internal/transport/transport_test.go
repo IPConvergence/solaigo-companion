@@ -148,7 +148,7 @@ func TestSessionHandlesServerPing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	err = session.Run(ctx)
+	err = session.Run(ctx, nil)
 	if err == nil || !strings.Contains(err.Error(), "bye") {
 		t.Errorf("Run should end on bye, got %v", err)
 	}

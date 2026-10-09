@@ -10,6 +10,7 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -69,7 +70,16 @@ type Session struct {
 	conn      *websocket.Conn
 	SessionID int
 	Limits    map[string]int
+	// lastDetectedJSON is the JSON of what hello (or the most recent
+	// ``models.updated``) carried. Compared against the next discover tick's
+	// output to decide whether to send another ``models.updated``.
+	lastDetectedJSON string
 }
+
+// How often Session.Run re-runs Discover while connected, when the caller passes
+// one. PROTOCOL.md § models.updated caps unsolicited sends at one per 60s; this
+// matches that ceiling.
+const DiscoverInterval = 60 * time.Second
 
 // Dial opens the WebSocket, sends ``hello`` with the given metadata, and reads
 // back ``welcome``. Returns the open session for Run.
@@ -121,7 +131,25 @@ func Dial(ctx context.Context, token config.Token, companionVersion, hostname, o
 		return nil, fmt.Errorf("expected welcome frame, got type=%q", welcome.Type)
 	}
 
-	return &Session{conn: conn, SessionID: welcome.SessionID, Limits: welcome.Limits}, nil
+	s := &Session{conn: conn, SessionID: welcome.SessionID, Limits: welcome.Limits}
+	// Record what hello carried, so the first discover tick in Run only sends a
+	// ``models.updated`` if the list has actually moved.
+	s.lastDetectedJSON = jsonOfDetected(detected)
+	return s, nil
+}
+
+// jsonOfDetected produces a stable string for comparing one discover result to
+// the next. json.Marshal preserves list order; the detector emits a fixed order
+// so swapped positions do not look like a change.
+func jsonOfDetected(detected []DetectedServer) string {
+	if detected == nil {
+		detected = []DetectedServer{}
+	}
+	raw, err := json.Marshal(detected)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 // Run blocks until the context is cancelled or the server closes.
@@ -131,9 +159,21 @@ func Dial(ctx context.Context, token config.Token, companionVersion, hostname, o
 // writes, inference goroutines spawned for ``inference.request`` enqueue their
 // deltas on outbound. One writer at the WS layer, which keeps
 // coder/websocket's single-writer rule honest without a mutex.
-func (s *Session) Run(ctx context.Context) error {
+//
+// ``discover`` is called every :const:`DiscoverInterval` while the session is
+// up; when its output differs from the last-sent list, a ``models.updated``
+// frame goes out. Pass nil to disable periodic re-detect (tests do this; the
+// daemon always passes :func:`detect.All`).
+func (s *Session) Run(ctx context.Context, discover func() []DetectedServer) error {
 	pingTicker := time.NewTicker(PingInterval)
 	defer pingTicker.Stop()
+	// Nil-safe: a stopped ticker's channel never fires, which is what we want
+	// when the caller passed no discover function.
+	discoverTicker := time.NewTicker(DiscoverInterval)
+	defer discoverTicker.Stop()
+	if discover == nil {
+		discoverTicker.Stop()
+	}
 
 	// Outbound frame channel. 128 slots is enough for one Ollama stream in
 	// flight even on a fast model; backpressure beyond that is a sign of a
@@ -184,6 +224,22 @@ func (s *Session) Run(ctx context.Context) error {
 				"type": "ping",
 				"t":    time.Now().Unix(),
 			})
+
+		case <-discoverTicker.C:
+			// Re-probe the local LLM servers. On the first change (model
+			// pulled, model removed, server stopped), push a
+			// ``models.updated`` frame; the backend's reader loop writes it
+			// to the session row's ``detected`` column, and the cockpit UI
+			// picks it up on its next refresh of /api/companion.
+			current := discover()
+			encoded := jsonOfDetected(current)
+			if encoded != s.lastDetectedJSON {
+				s.lastDetectedJSON = encoded
+				outbound <- map[string]any{
+					"type":     "models.updated",
+					"detected": current,
+				}
+			}
 
 		case frame := <-outbound:
 			if err := wsjson.Write(ctx, s.conn, frame); err != nil {

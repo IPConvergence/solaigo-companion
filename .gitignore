@@ -1,0 +1,24 @@
+# Build output
+solaigo-companion
+solaigo-companion.exe
+/dist/
+
+# Go workspace temporaries
+*.test
+*.out
+coverage.*
+vendor/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Local pairing state during development — never commit a real token
+/token
+/token.dat

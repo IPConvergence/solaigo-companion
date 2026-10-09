@@ -1,20 +1,36 @@
 // Package main is the Solaigo Companion entry point.
 //
-// The subcommands are declared here but not yet implemented; this scaffold compiles,
-// runs, prints help, and reports its version. Phase 2 wires the subcommands to the
-// pair/transport/detect/proxy packages that will live under internal/.
+// Phase 2 Step 2: ``pair``, ``status`` and ``logout`` are now wired to real behaviour.
+// ``install`` (register as a user-level service) is Phase 2 Step 3 — it only has
+// something to do once the daemon that stays connected to the cockpit exists, and
+// that is Step 3's job.
 //
 // Design: docs/DESIGN.md. Protocol: docs/PROTOCOL.md.
 package main
 
 import (
+	"bufio"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/IPConvergence/solaigo-companion/internal/claim"
+	"github.com/IPConvergence/solaigo-companion/internal/config"
 )
 
 // Set by the release workflow via -ldflags "-X main.version=...". The default is
 // what someone running `go build` out of a working tree sees.
 var version = "0.0.0-dev"
+
+// Where the Companion dials by default. A single setting rather than a build-time
+// choice so a developer can point at a local cockpit with ``--server`` and nothing
+// else changes.
+const defaultServer = "https://www.solaigo.com/cockpit"
 
 const usage = `solaigo-companion — bridge a local LLM to your Solaigo account
 
@@ -24,14 +40,16 @@ Usage:
 Commands:
   pair       Enter a pairing code from the cockpit and claim a token
   login      Alias for pair, named for people who expect it
-  status     Show the pairing state and the detected local LLM servers
-  logout     Revoke this Companion's token locally; the cockpit still shows it
+  status     Show the pairing state and the server this Companion dials
+  logout     Clear this Companion's token locally; the cockpit still shows it
              until you remove it there
   version    Print the version string
 
-Run 'solaigo-companion <command> -h' for subcommand help.
+Common flags:
+  --server URL   Cockpit base URL (default: https://www.solaigo.com/cockpit)
+  --code  CODE   Pairing code, so you can script it instead of typing it in
 
-Design and protocol documents live in docs/ in the solaigo-companion repository.
+Run 'solaigo-companion <command> -h' for subcommand help.
 `
 
 func main() {
@@ -40,29 +58,166 @@ func main() {
 		os.Exit(2)
 	}
 
-	switch os.Args[1] {
+	cmd := os.Args[1]
+	args := os.Args[2:]
+
+	switch cmd {
 	case "version", "-v", "--version":
 		fmt.Println(version)
 	case "pair", "login":
-		notYet("pair")
+		if err := runPair(args, os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "pair:", err)
+			os.Exit(1)
+		}
 	case "status":
-		notYet("status")
+		if err := runStatus(args, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "status:", err)
+			os.Exit(1)
+		}
 	case "logout":
-		notYet("logout")
+		if err := runLogout(args, os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "logout:", err)
+			os.Exit(1)
+		}
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %q\n\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command: %q\n\n", cmd)
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
 	}
 }
 
-// Deliberate stub: the scaffold ships compiled and runnable so the release pipeline
-// can be exercised end-to-end before any real code is written. Phase 2 replaces each
-// stub with the implementation.
-func notYet(cmd string) {
-	fmt.Fprintf(os.Stderr, "%s: not implemented yet — this is a Phase 1 scaffold.\n", cmd)
-	fmt.Fprintln(os.Stderr, "See docs/DESIGN.md for the planned behaviour.")
-	os.Exit(1)
+// runPair claims a code and saves the resulting token. Separated from main() so a
+// test can drive it with a fake stdin and a captured stdout, without touching the
+// process's real file descriptors.
+func runPair(args []string, in io.Reader, out io.Writer) error {
+	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
+	fs.SetOutput(out)
+	server := fs.String("server", defaultServer, "cockpit base URL")
+	code := fs.String("code", "", "pairing code (prompted if omitted)")
+	force := fs.Bool("force", false, "overwrite an existing paired token without asking")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// Refuse to overwrite an existing token silently: pairing again on top of a
+	// working token would leak the previous one from this machine's state (the
+	// cockpit still has it) and the user who ran it twice would not know.
+	if existing, err := config.Load(); err == nil && existing != nil && !*force {
+		return fmt.Errorf(
+			"this Companion is already paired to %s (session %d). "+
+				"Run `solaigo-companion logout` first, or re-run with --force to replace it",
+			existing.Server, existing.SessionID,
+		)
+	}
+
+	if *code == "" {
+		fmt.Fprint(out, "Pairing code (from your Solaigo cockpit): ")
+		typed, err := bufio.NewReader(in).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("could not read the code: %w", err)
+		}
+		*code = strings.TrimSpace(typed)
+	}
+	*code = strings.ToUpper(strings.TrimSpace(*code))
+	if *code == "" {
+		return errors.New("no code given")
+	}
+
+	req := claim.Request{
+		Code:             *code,
+		CompanionVersion: version,
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		Hostname:         config.Hostname(),
+	}
+
+	fmt.Fprintln(out, "Claiming code with", *server, "…")
+	resp, err := claim.Claim(*server, req, 15*time.Second)
+	if err != nil {
+		return err
+	}
+
+	t := config.Token{
+		Server:    strings.TrimRight(*server, "/"),
+		Token:     resp.Token,
+		WSSURL:    resp.WSSURL,
+		SessionID: resp.SessionID,
+	}
+	if err := config.Save(t); err != nil {
+		return fmt.Errorf("could not save the token: %w", err)
+	}
+
+	path, _ := config.TokenPath()
+	fmt.Fprintf(out, "Paired. Token saved to %s (mode 0600).\n", path)
+	fmt.Fprintln(out, "The Companion will appear in your cockpit under 'Compagnons' as", req.Hostname+".")
+	fmt.Fprintln(out, "Phase 2 Step 3 brings the live connection; today, nothing stays running.")
+	return nil
+}
+
+func runStatus(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("status", flag.ContinueOnError)
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	t, err := config.Load()
+	if errors.Is(err, config.ErrNoToken) {
+		fmt.Fprintln(out, "Not paired. Run `solaigo-companion pair` to get started.")
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	path, _ := config.TokenPath()
+	fmt.Fprintln(out, "Paired.")
+	fmt.Fprintln(out, "  Server     :", t.Server)
+	fmt.Fprintln(out, "  Session ID :", t.SessionID)
+	fmt.Fprintln(out, "  WSS URL    :", t.WSSURL)
+	fmt.Fprintln(out, "  Token file :", path)
+	// The token value itself is deliberately not printed, same reason the cockpit
+	// never sends it back out: a terminal buffer, a tmux scrollback, a screen share
+	// — four places a credential should not land for the sake of a status line.
+	return nil
+}
+
+func runLogout(args []string, in io.Reader, out io.Writer) error {
+	fs := flag.NewFlagSet("logout", flag.ContinueOnError)
+	fs.SetOutput(out)
+	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	t, err := config.Load()
+	if errors.Is(err, config.ErrNoToken) {
+		fmt.Fprintln(out, "Not paired. Nothing to clear.")
+		return nil
+	}
+	if err != nil {
+		// The file exists but is unreadable — delete it anyway, the user asked.
+		fmt.Fprintln(out, "The token file is unreadable; clearing it.")
+	}
+
+	if !*yes {
+		fmt.Fprint(out, "Clear the local token")
+		if t != nil {
+			fmt.Fprintf(out, " (session %d on %s)", t.SessionID, t.Server)
+		}
+		fmt.Fprint(out, "? [y/N] ")
+		typed, _ := bufio.NewReader(in).ReadString('\n')
+		if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(typed)), "y") {
+			fmt.Fprintln(out, "Kept.")
+			return nil
+		}
+	}
+
+	if err := config.Delete(); err != nil {
+		return err
+	}
+	fmt.Fprintln(out, "Local token cleared.")
+	fmt.Fprintln(out, "The cockpit still shows this Companion until you remove it there.")
+	return nil
 }

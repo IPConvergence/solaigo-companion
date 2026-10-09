@@ -1,26 +1,31 @@
 // Package main is the Solaigo Companion entry point.
 //
-// Phase 2 Step 2: ``pair``, ``status`` and ``logout`` are now wired to real behaviour.
-// ``install`` (register as a user-level service) is Phase 2 Step 3 — it only has
-// something to do once the daemon that stays connected to the cockpit exists, and
-// that is Step 3's job.
+// Phase 2 Step 3: ``daemon`` opens the WebSocket to the cockpit and keeps it
+// open with reconnect-and-backoff. ``install`` and ``uninstall`` register the
+// binary as a user-level service on each OS so the daemon runs on login
+// without the user having to think about it.
 //
 // Design: docs/DESIGN.md. Protocol: docs/PROTOCOL.md.
 package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/IPConvergence/solaigo-companion/internal/claim"
 	"github.com/IPConvergence/solaigo-companion/internal/config"
+	"github.com/IPConvergence/solaigo-companion/internal/transport"
 )
 
 // Set by the release workflow via -ldflags "-X main.version=...". The default is
@@ -43,6 +48,10 @@ Commands:
   status     Show the pairing state and the server this Companion dials
   logout     Clear this Companion's token locally; the cockpit still shows it
              until you remove it there
+  daemon     Keep an open WebSocket to the cockpit. Runs in the foreground;
+             the install command registers it as a background service
+  install    Register this binary as a user-level service that runs on login
+  uninstall  Remove the service registration
   version    Print the version string
 
 Common flags:
@@ -77,6 +86,21 @@ func main() {
 	case "logout":
 		if err := runLogout(args, os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "logout:", err)
+			os.Exit(1)
+		}
+	case "daemon":
+		if err := runDaemon(args, os.Stderr); err != nil {
+			fmt.Fprintln(os.Stderr, "daemon:", err)
+			os.Exit(1)
+		}
+	case "install":
+		if err := runInstall(args, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "install:", err)
+			os.Exit(1)
+		}
+	case "uninstall":
+		if err := runUninstall(args, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "uninstall:", err)
 			os.Exit(1)
 		}
 	case "-h", "--help", "help":
@@ -220,4 +244,52 @@ func runLogout(args []string, in io.Reader, out io.Writer) error {
 	fmt.Fprintln(out, "Local token cleared.")
 	fmt.Fprintln(out, "The cockpit still shows this Companion until you remove it there.")
 	return nil
+}
+
+func runDaemon(args []string, logOut io.Writer) error {
+	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
+	fs.SetOutput(logOut)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	token, err := config.Load()
+	if err != nil {
+		if errors.Is(err, config.ErrNoToken) {
+			return transport.ErrNotPaired
+		}
+		return err
+	}
+
+	// SIGINT / SIGTERM cancel the context, which cascades into the dial loop,
+	// the reader goroutine and the ping ticker — Run returns promptly rather
+	// than being killed under its feet.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	return transport.Loop(ctx, transport.LoopOptions{
+		Token:            *token,
+		CompanionVersion: version,
+		Hostname:         config.Hostname(),
+		Log:              log.New(logOut, "", log.LstdFlags),
+		// Discover is nil in Step 3: no local-LLM probing yet. Step 4 wires in
+		// an Ollama/LM Studio detector and passes it here.
+	})
+}
+
+func runInstall(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("install", flag.ContinueOnError)
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return installService(out)
+}
+
+func runUninstall(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
+	fs.SetOutput(out)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	return uninstallService(out)
 }

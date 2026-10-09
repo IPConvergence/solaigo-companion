@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # make sure git describe sees the tag
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Cross-compile for every supported platform
+        env:
+          # The Makefile derives VERSION from `git describe` when VERSION isn't
+          # passed in; passing it explicitly guarantees the string stamped into
+          # the binary matches the tag exactly, no leading `v` games.
+          VERSION: ${{ github.ref_name }}
+        run: make cross
+
+      - name: Create release and upload binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          # Pre-release flag kicks in automatically for -alpha/-beta/-rc suffixes,
+          # which is what the semver spec and GitHub's own detection use. Explicit
+          # here so a mis-tagged v1.0.0-alpha.1 still ships marked as pre-release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body: |
+            One binary per supported platform, built from the tag `${{ github.ref_name }}`.
+            See [`docs/DESIGN.md`](docs/DESIGN.md) for what this is and is not.
+
+            **Install** (manual, until the installers land):
+
+            ```sh
+            # Linux
+            curl -LO https://github.com/IPConvergence/solaigo-companion/releases/download/${{ github.ref_name }}/solaigo-companion-linux-amd64
+            chmod +x solaigo-companion-linux-amd64
+            ./solaigo-companion-linux-amd64 version
+
+            # macOS (Apple Silicon)
+            curl -LO https://github.com/IPConvergence/solaigo-companion/releases/download/${{ github.ref_name }}/solaigo-companion-darwin-arm64
+            chmod +x solaigo-companion-darwin-arm64
+            ./solaigo-companion-darwin-arm64 version
+            ```
+
+            The Solaigo cockpit at https://www.solaigo.com/cockpit/ serves the right
+            binary automatically for the OS it detects, so day-to-day users do not
+            need the URLs above.

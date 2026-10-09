@@ -68,4 +68,5 @@ spells out what Phase 2 adds there.
 
 ## License
 
-To be decided before V1 ships. The code is private until then.
+Apache License 2.0. See [`LICENSE`](LICENSE). Permissive, patent-grant included, no
+copyleft reach into applications that use Companion as a dependency.

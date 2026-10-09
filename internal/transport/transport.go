@@ -13,12 +13,15 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/IPConvergence/solaigo-companion/internal/config"
+	"github.com/IPConvergence/solaigo-companion/internal/detect"
+	"github.com/IPConvergence/solaigo-companion/internal/proxy"
 )
 
 // Subprotocol the Companion offers on upgrade. The cockpit refuses the socket
@@ -121,13 +124,23 @@ func Dial(ctx context.Context, token config.Token, companionVersion, hostname, o
 	return &Session{conn: conn, SessionID: welcome.SessionID, Limits: welcome.Limits}, nil
 }
 
-// Run blocks until the context is cancelled or the server closes. All writes
-// happen on this goroutine; the reader runs in a separate one and only reads.
-// This keeps coder/websocket's single-writer constraint satisfied without a
-// mutex and makes the control flow single-threaded from the writer's side.
+// Run blocks until the context is cancelled or the server closes.
+//
+// All writes to the WebSocket pass through the ``outbound`` channel, which is
+// drained by this goroutine — the reader runs in a separate one and never
+// writes, inference goroutines spawned for ``inference.request`` enqueue their
+// deltas on outbound. One writer at the WS layer, which keeps
+// coder/websocket's single-writer rule honest without a mutex.
 func (s *Session) Run(ctx context.Context) error {
 	pingTicker := time.NewTicker(PingInterval)
 	defer pingTicker.Stop()
+
+	// Outbound frame channel. 128 slots is enough for one Ollama stream in
+	// flight even on a fast model; backpressure beyond that is a sign of a
+	// stuck WS writer and the proxy goroutines block briefly, which is the
+	// right behaviour — dropping deltas silently would make the webapp show
+	// a half-finished answer.
+	outbound := make(chan map[string]any, 128)
 
 	// Reader goroutine. Drains frames into msgs; errors (including the server
 	// closing cleanly) go to readerErr and end Run.
@@ -151,6 +164,11 @@ func (s *Session) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Per-request cancellation. The dispatcher stores a cancel func per
+	// request_id; ``inference.cancel`` looks it up and invokes it.
+	cancels := make(map[string]context.CancelFunc)
+	var cancelsMu sync.Mutex
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -162,11 +180,14 @@ func (s *Session) Run(ctx context.Context) error {
 			return err
 
 		case <-pingTicker.C:
-			if err := wsjson.Write(ctx, s.conn, map[string]any{
+			s.enqueue(outbound, map[string]any{
 				"type": "ping",
 				"t":    time.Now().Unix(),
-			}); err != nil {
-				return fmt.Errorf("ping failed: %w", err)
+			})
+
+		case frame := <-outbound:
+			if err := wsjson.Write(ctx, s.conn, frame); err != nil {
+				return fmt.Errorf("ws write: %w", err)
 			}
 
 		case msg, ok := <-msgs:
@@ -174,36 +195,188 @@ func (s *Session) Run(ctx context.Context) error {
 				// Reader closed its channel — session is done.
 				return nil
 			}
-			if err := s.handle(ctx, msg); err != nil {
+			if err := s.handle(ctx, msg, outbound, cancels, &cancelsMu); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-// handle dispatches one incoming frame. Only ``ping`` sends a reply from here;
-// everything else is either a no-op (``pong``) or ends the session (``bye``).
-// Phase 2 Step 4 adds ``inference.request`` → forward to local LLM.
-func (s *Session) handle(ctx context.Context, msg map[string]any) error {
+// enqueue puts a frame on outbound without blocking the caller if the channel
+// is full. Used for pings only: a dropped ping is harmless — the next tick is
+// in 30s and the server's idle timeout is 90s.
+func (s *Session) enqueue(outbound chan<- map[string]any, frame map[string]any) {
+	select {
+	case outbound <- frame:
+	default:
+	}
+}
+
+// handle dispatches one incoming frame. ``ping`` echoes a pong; ``bye`` ends
+// the session; ``inference.request`` spawns a goroutine that forwards to the
+// local LLM; ``inference.cancel`` cancels an in-flight inference by request_id.
+// Everything else is dropped forward-compatibly.
+func (s *Session) handle(
+	ctx context.Context,
+	msg map[string]any,
+	outbound chan<- map[string]any,
+	cancels map[string]context.CancelFunc,
+	cancelsMu *sync.Mutex,
+) error {
 	kind, _ := msg["type"].(string)
 	switch kind {
 	case "pong":
 		// Just resets the idle clock on both sides, nothing to do here.
 		return nil
 	case "ping":
-		return wsjson.Write(ctx, s.conn, map[string]any{
-			"type": "pong",
-			"t":    msg["t"],
-		})
+		outbound <- map[string]any{"type": "pong", "t": msg["t"]}
+		return nil
 	case "bye":
 		code, _ := msg["code"].(string)
 		reason, _ := msg["message"].(string)
 		return fmt.Errorf("cockpit sent bye code=%q: %s", code, reason)
+	case "inference.request":
+		rid, _ := msg["request_id"].(string)
+		if rid == "" {
+			return nil
+		}
+		reqCtx, cancel := context.WithCancel(ctx)
+		cancelsMu.Lock()
+		cancels[rid] = cancel
+		cancelsMu.Unlock()
+		go runInference(reqCtx, msg, outbound, func() {
+			cancelsMu.Lock()
+			delete(cancels, rid)
+			cancelsMu.Unlock()
+			cancel()
+		})
+		return nil
+	case "inference.cancel":
+		rid, _ := msg["request_id"].(string)
+		cancelsMu.Lock()
+		if c, ok := cancels[rid]; ok {
+			c()
+		}
+		cancelsMu.Unlock()
+		return nil
 	default:
 		// Forward-compatible: an older Companion ignores frame types a newer
 		// cockpit introduces, so the server-side keeps moving independently.
 		return nil
 	}
+}
+
+// runInference forwards one request to the local LLM. The caller already
+// stored the cancel func under request_id so inference.cancel can abort this.
+// All frames are tagged with the request_id before enqueue — the backend
+// demultiplexes by it.
+func runInference(
+	ctx context.Context,
+	request map[string]any,
+	outbound chan<- map[string]any,
+	done func(),
+) {
+	defer done()
+	rid, _ := request["request_id"].(string)
+
+	serverTag, _ := request["server"].(string)
+	// Phase 2 Step 4 only knows about Ollama. If the backend asked for a
+	// specific server that we do not have a base URL for, fall back to Ollama
+	// — a Companion in a V1.1 release will know more servers, but a current
+	// cockpit asking for one is not a reason to refuse the request outright.
+	baseURL := detect.BaseURL(serverTag)
+	if baseURL == "" {
+		baseURL = detect.BaseURL("ollama")
+	}
+	if baseURL == "" {
+		send(ctx, outbound, map[string]any{
+			"type":       "inference.error",
+			"request_id": rid,
+			"code":       "local_unreachable",
+			"message":    "No supported local LLM server is configured.",
+			"retriable":  true,
+		})
+		return
+	}
+
+	req, err := requestFromFrame(request)
+	if err != nil {
+		send(ctx, outbound, map[string]any{
+			"type":       "inference.error",
+			"request_id": rid,
+			"code":       "malformed",
+			"message":    err.Error(),
+		})
+		return
+	}
+
+	err = proxy.Run(ctx, baseURL, req, func(frame proxy.Frame) {
+		frame["request_id"] = rid
+		send(ctx, outbound, frame)
+	})
+	if err != nil {
+		// Context cancelled: the backend already knows (it is the one that
+		// sent inference.cancel, or the WS dropped). Nothing more to say.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			send(ctx, outbound, map[string]any{
+				"type":       "inference.error",
+				"request_id": rid,
+				"code":       "cancelled",
+				"message":    "The request was cancelled.",
+			})
+			return
+		}
+		var httpErr *proxy.HTTPError
+		if errors.As(err, &httpErr) {
+			send(ctx, outbound, map[string]any{
+				"type":       "inference.error",
+				"request_id": rid,
+				"code":       "local_error",
+				"message":    httpErr.Error(),
+				"retriable":  httpErr.Status >= 500,
+			})
+			return
+		}
+		send(ctx, outbound, map[string]any{
+			"type":       "inference.error",
+			"request_id": rid,
+			"code":       "local_unreachable",
+			"message":    err.Error(),
+			"retriable":  true,
+		})
+	}
+}
+
+// send enqueues a frame or gives up when ctx is cancelled. If the WS writer is
+// so backed up the channel is full for the full ctx lifetime, the frame is
+// dropped — which is the only honest thing to do.
+func send(ctx context.Context, outbound chan<- map[string]any, frame map[string]any) {
+	select {
+	case outbound <- frame:
+	case <-ctx.Done():
+	}
+}
+
+// requestFromFrame reshapes the inference.request body into what the proxy
+// expects. The frame comes off JSON, so every nested value is already a
+// map[string]any or []any — we assert the structure, not re-parse.
+func requestFromFrame(frame map[string]any) (proxy.Request, error) {
+	model, _ := frame["model"].(string)
+	if model == "" {
+		return proxy.Request{}, errors.New("the inference.request did not carry a model name")
+	}
+	raw, _ := frame["messages"].([]any)
+	messages := make([]map[string]any, 0, len(raw))
+	for _, m := range raw {
+		if mm, ok := m.(map[string]any); ok {
+			messages = append(messages, mm)
+		}
+	}
+	if len(messages) == 0 {
+		return proxy.Request{}, errors.New("the inference.request had no messages")
+	}
+	params, _ := frame["params"].(map[string]any)
+	return proxy.Request{Model: model, Messages: messages, Params: params}, nil
 }
 
 // Close sends a bye and closes the socket. Called on SIGINT/SIGTERM so the

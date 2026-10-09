@@ -25,6 +25,7 @@ import (
 
 	"github.com/IPConvergence/solaigo-companion/internal/claim"
 	"github.com/IPConvergence/solaigo-companion/internal/config"
+	"github.com/IPConvergence/solaigo-companion/internal/detect"
 	"github.com/IPConvergence/solaigo-companion/internal/transport"
 )
 
@@ -271,9 +272,24 @@ func runDaemon(args []string, logOut io.Writer) error {
 		CompanionVersion: version,
 		Hostname:         config.Hostname(),
 		Log:              log.New(logOut, "", log.LstdFlags),
-		// Discover is nil in Step 3: no local-LLM probing yet. Step 4 wires in
-		// an Ollama/LM Studio detector and passes it here.
+		// Step 4: probe 127.0.0.1 for a local LLM server. Only Ollama is
+		// supported today; the other three listed in docs/DESIGN.md arrive
+		// in Step 4.1.
+		Discover: discoverLocal,
 	})
+}
+
+// discoverLocal is the Discover function the daemon loop calls before each
+// Dial. Converts internal/detect's shape into the one transport.LoopOptions
+// expects. One ctx.Background() per probe is fine: the probes have their own
+// short deadlines in internal/detect.
+func discoverLocal() []transport.DetectedServer {
+	servers := detect.All(context.Background())
+	out := make([]transport.DetectedServer, 0, len(servers))
+	for _, s := range servers {
+		out = append(out, transport.DetectedServer{Server: s.Server, Models: s.Models})
+	}
+	return out
 }
 
 func runInstall(args []string, out io.Writer) error {

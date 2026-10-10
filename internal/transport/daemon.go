@@ -55,14 +55,6 @@ func Loop(ctx context.Context, opts LoopOptions) error {
 		if opts.Discover != nil {
 			detected = opts.Discover()
 		}
-		// Temporary diagnostic (Phase 2 Step 4 debugging): log what we are about to
-		// report in hello.detected. Remove once models.updated frames land.
-		for _, srv := range detected {
-			logger.Printf("detected %s with %d model(s): %v", srv.Server, len(srv.Models), srv.Models)
-		}
-		if len(detected) == 0 {
-			logger.Printf("detected: nothing (no local LLM reachable)")
-		}
 		session, err := Dial(
 			ctx, opts.Token, opts.CompanionVersion, opts.Hostname,
 			runtime.GOOS, runtime.GOARCH, detected,

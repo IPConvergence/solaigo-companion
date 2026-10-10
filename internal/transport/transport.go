@@ -204,6 +204,36 @@ func (s *Session) Run(ctx context.Context, discover func() []DetectedServer) err
 		}
 	}()
 
+	// WS-level ping watchdog. The application-level JSON ping below keeps the
+	// backend's reader-loop timer happy; this one keeps *us* honest about a
+	// half-dead TCP that wsjson.Write might not catch — NAT drops idle flows
+	// without sending FIN either way, and the writer-side error eventually
+	// shows up but may take minutes. conn.Ping sends a WS protocol-level PING
+	// (the library auto-pongs on the other side) and waits for the pong; on
+	// timeout the session ends and the daemon loop reconnects.
+	watchdogErr := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(PingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-readerCtx.Done():
+				return
+			case <-ticker.C:
+				pingCtx, cancel := context.WithTimeout(readerCtx, 10*time.Second)
+				err := s.conn.Ping(pingCtx)
+				cancel()
+				if err != nil {
+					select {
+					case watchdogErr <- fmt.Errorf("ws ping failed: %w", err):
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+
 	// Per-request cancellation. The dispatcher stores a cancel func per
 	// request_id; ``inference.cancel`` looks it up and invokes it.
 	cancels := make(map[string]context.CancelFunc)
@@ -219,11 +249,28 @@ func (s *Session) Run(ctx context.Context, discover func() []DetectedServer) err
 			// the daemon loop decides whether to reconnect.
 			return err
 
+		case err := <-watchdogErr:
+			// The WS-level ping did not get its pong in time. The TCP flow
+			// has gone half-dead; closing it here lets the daemon loop reopen
+			// a fresh one, where normal reads and writes work again.
+			return err
+
 		case <-pingTicker.C:
-			s.enqueue(outbound, map[string]any{
+			// Ping is a liveness signal: the backend's idle timeout is 90s
+			// and closes the WS if no frame arrives, so a dropped ping is a
+			// silent half-dead connection waiting to happen. Block on
+			// outbound rather than enqueue-and-drop; if the WS writer is so
+			// backed up that a ping cannot slip through for 90s, something
+			// bigger is wrong and ending the session so the daemon
+			// reconnects is the right outcome.
+			select {
+			case outbound <- map[string]any{
 				"type": "ping",
 				"t":    time.Now().Unix(),
-			})
+			}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 
 		case <-discoverTicker.C:
 			// Re-probe the local LLM servers. On the first change (model

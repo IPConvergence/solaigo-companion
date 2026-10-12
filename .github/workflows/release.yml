@@ -47,23 +47,12 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           body: |
-            One binary per supported platform, built from the tag `${{ github.ref_name }}`.
+            One binary per supported platform, built from the tag `${{ github.ref_name }}`,
+            and `SHA256SUMS` to check them against.
+
+            **Install**: open your Solaigo cockpit → AI connections → Pair a Companion.
+            It shows one command for your system, with your pairing code filled in. The
+            command downloads the right binary through the cockpit, checks it against
+            `SHA256SUMS`, pairs it, and starts it now and at every login.
+
             See [`docs/DESIGN.md`](docs/DESIGN.md) for what this is and is not.
-
-            **Install** (manual, until the installers land):
-
-            ```sh
-            # Linux
-            curl -LO https://github.com/IPConvergence/solaigo-companion/releases/download/${{ github.ref_name }}/solaigo-companion-linux-amd64
-            chmod +x solaigo-companion-linux-amd64
-            ./solaigo-companion-linux-amd64 version
-
-            # macOS (Apple Silicon)
-            curl -LO https://github.com/IPConvergence/solaigo-companion/releases/download/${{ github.ref_name }}/solaigo-companion-darwin-arm64
-            chmod +x solaigo-companion-darwin-arm64
-            ./solaigo-companion-darwin-arm64 version
-            ```
-
-            The Solaigo cockpit at https://www.solaigo.com/cockpit/ serves the right
-            binary automatically for the OS it detects, so day-to-day users do not
-            need the URLs above.

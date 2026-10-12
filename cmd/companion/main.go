@@ -51,7 +51,7 @@ Commands:
              until you remove it there
   daemon     Keep an open WebSocket to the cockpit. Runs in the foreground;
              the install command registers it as a background service
-  install    Register this binary as a user-level service that runs on login
+  install    Copy this binary somewhere stable, start it now and at every login
   uninstall  Remove the service registration
   version    Print the version string
 
@@ -176,8 +176,8 @@ func runPair(args []string, in io.Reader, out io.Writer) error {
 
 	path, _ := config.TokenPath()
 	fmt.Fprintf(out, "Paired. Token saved to %s (mode 0600).\n", path)
-	fmt.Fprintln(out, "The Companion will appear in your cockpit under 'Compagnons' as", req.Hostname+".")
-	fmt.Fprintln(out, "Phase 2 Step 3 brings the live connection; today, nothing stays running.")
+	fmt.Fprintln(out, "It appears in your cockpit, under Companions, as", req.Hostname+".")
+	fmt.Fprintln(out, "To keep it running, now and at every login: solaigo-companion install")
 	return nil
 }
 
@@ -250,8 +250,17 @@ func runLogout(args []string, in io.Reader, out io.Writer) error {
 func runDaemon(args []string, logOut io.Writer) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	fs.SetOutput(logOut)
+	background := fs.Bool("background", false, "started at login with no terminal: log to a file")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *background {
+		// Started at logon on Windows, where a console program gets a window: let go
+		// of it, and write to the log file nobody has to keep a terminal open for.
+		detachConsole()
+		if file, err := backgroundLog(); err == nil {
+			logOut = file
+		}
 	}
 	token, err := config.Load()
 	if err != nil {
@@ -298,7 +307,7 @@ func runInstall(args []string, out io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	return installService(out)
+	return install(out)
 }
 
 func runUninstall(args []string, out io.Writer) error {

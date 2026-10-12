@@ -31,13 +31,18 @@ tidy: ## Tidy the module file
 run: build ## Build and run with --help
 	./$(BINARY) --help
 
-# Cross-compile matrix. Four target triples cover 99% of desktops.
-cross: ## Build release binaries for linux, macos (intel + arm), windows
+# Cross-compile matrix. ARM on Linux is a Raspberry Pi or an ARM server; on Windows
+# it is a Snapdragon laptop, which would otherwise run the amd64 build emulated.
+cross: ## Build release binaries for linux, macos and windows, intel and arm, with SHA256SUMS
 	mkdir -p $(DIST)
 	GOOS=linux   GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(DIST)/$(BINARY)-linux-amd64        $(PKG)
+	GOOS=linux   GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(DIST)/$(BINARY)-linux-arm64        $(PKG)
 	GOOS=darwin  GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(DIST)/$(BINARY)-darwin-amd64       $(PKG)
 	GOOS=darwin  GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(DIST)/$(BINARY)-darwin-arm64       $(PKG)
 	GOOS=windows GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o $(DIST)/$(BINARY)-windows-amd64.exe  $(PKG)
+	GOOS=windows GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(DIST)/$(BINARY)-windows-arm64.exe  $(PKG)
+	# The installers check every download against this before running it.
+	cd $(DIST) && (command -v sha256sum >/dev/null && sha256sum $(BINARY)-* || shasum -a 256 $(BINARY)-*) > SHA256SUMS
 	@echo
 	@ls -lh $(DIST)/
 

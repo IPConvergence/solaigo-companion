@@ -195,16 +195,28 @@ back to unpaired state and the next run will prompt for a code.
 
 ## OS lifecycle
 
-Companion runs as a user-level service:
+Companion runs as a user-level service. `install` first copies the binary somewhere
+stable — the download folder is where people tidy, and a service pointing there stops
+the day it is emptied — then registers that copy and starts it at once:
 
-- **Linux:** systemd user unit (`systemctl --user enable solaigo-companion`). Starts
-  on session login, restarts on failure with exponential backoff.
-- **macOS:** `launchd` user agent (`~/Library/LaunchAgents/com.solaigo.companion.plist`).
-  Loads on login, `KeepAlive = true`.
-- **Windows:** installed as a per-user scheduled task running at logon, pointing at
-  `%LocalAppData%\Programs\solaigo-companion\solaigo-companion.exe`.
+- **Linux:** `~/.local/bin/solaigo-companion`, a systemd user unit
+  (`~/.config/systemd/user/solaigo-companion.service`), restarted on failure. Lingering
+  is enabled where the system allows it, so a server reached over SSH keeps it running
+  after logout; otherwise `install` prints the `sudo loginctl enable-linger` line.
+- **macOS:** `~/Library/Application Support/solaigo-companion/bin/`, a `launchd` user
+  agent (`~/Library/LaunchAgents/com.solaigo.companion.plist`), restarted when it fails
+  but not when it exits cleanly (removed from the cockpit). Logs in
+  `~/Library/Logs/solaigo-companion.log`.
+- **Windows:** `%LocalAppData%\Programs\Solaigo Companion\solaigo-companion.exe`,
+  started at logon from the current user's `Run` key and launched hidden right away.
+  Not a scheduled task: `schtasks /sc onlogon` needs an administrator. The Run key
+  restarts nothing on a crash; the daemon's reconnect loop and the next logon do.
+  Logs in `%LocalAppData%\solaigo-companion\companion.log`.
 
-The installer places the unit files and starts the service. Uninstall removes them.
+`install` refuses until the Companion is paired, since a service with no token would
+exit at once and be restarted forever. Running it again from a newer download is the
+upgrade: it stops the running copy, replaces it and starts it. Uninstall removes the
+registration and stops it.
 No root privileges are needed at any step.
 
 The CLI (`solaigo-companion`) is also directly runnable from a terminal, which is how

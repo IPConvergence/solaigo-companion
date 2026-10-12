@@ -49,11 +49,7 @@ WantedBy=default.target
 `, exe)
 }
 
-func installService(out io.Writer) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("could not resolve the current binary path: %w", err)
-	}
+func installService(out io.Writer, exe string) error {
 	unit, err := unitPath()
 	if err != nil {
 		return err
@@ -76,10 +72,22 @@ func installService(out io.Writer) error {
 	if err := systemctlUser("daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl --user daemon-reload: %w", err)
 	}
-	if err := systemctlUser("enable", "--now", "solaigo-companion"); err != nil {
-		return fmt.Errorf("systemctl --user enable --now solaigo-companion: %w", err)
+	if err := systemctlUser("enable", "solaigo-companion"); err != nil {
+		return fmt.Errorf("systemctl --user enable solaigo-companion: %w", err)
+	}
+	// restart rather than start: on an upgrade the old binary is still running, and
+	// the new copy is only picked up by a restart. On a first install it just starts.
+	if err := systemctlUser("restart", "solaigo-companion"); err != nil {
+		return fmt.Errorf("systemctl --user restart solaigo-companion: %w", err)
 	}
 	fmt.Fprintln(out, "Enabled and started solaigo-companion.service.")
+	// A user service stops when its user's last session ends — which on a server
+	// reached over SSH is the moment you log out. Lingering keeps it running.
+	// Best effort: some systems want an administrator for it, and then we say so.
+	if err := exec.Command("loginctl", "enable-linger").Run(); err != nil {
+		fmt.Fprintln(out, "To keep it running after you log out (a server you reach over SSH):")
+		fmt.Fprintln(out, "  sudo loginctl enable-linger "+os.Getenv("USER"))
+	}
 	fmt.Fprintln(out, "Check status with: systemctl --user status solaigo-companion")
 	fmt.Fprintln(out, "Follow logs with:  journalctl --user -u solaigo-companion -f")
 	return nil
@@ -108,3 +116,10 @@ func systemctlUser(args ...string) error {
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
+
+// stopRunning has nothing to do on Linux: the binary can be replaced while it runs,
+// and installService restarts the service onto the new copy.
+func stopRunning(io.Writer) {}
+
+// detachConsole is a Windows concern; systemd gives a daemon no terminal anyway.
+func detachConsole() {}

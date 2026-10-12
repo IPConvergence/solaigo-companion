@@ -5,9 +5,8 @@ computer to your Solaigo account, so a model you host locally is reachable from 
 cockpit the same way a hosted provider is — without opening any port, running any
 tunnel, or putting your laptop on the public internet.
 
-**Status: Phase 1 — specification and scaffolding.** This repository compiles and
-runs, but the subcommands are stubs. The design and the wire protocol are frozen in
-[`docs/`](docs/); Phase 2 is the implementation.
+**Status: alpha.** Pairing, the live connection, local inference through Ollama and
+the per-OS service are all in place. Design and wire protocol are in [`docs/`](docs/).
 
 ## What it does
 
@@ -15,11 +14,41 @@ runs, but the subcommands are stubs. The design and the wire protocol are frozen
 - Detects a local OpenAI-compatible server (Ollama, LM Studio, llama.cpp, vLLM).
 - Receives inference requests from the Solaigo backend, forwards them to the local
   server, streams the response back.
-- Runs as a user-level service — systemd on Linux, launchd on macOS, scheduled task
-  on Windows.
+- Runs as a user-level service — systemd on Linux, launchd on macOS, the Run key on
+  Windows — installed without administrator rights.
 
 What it is **not**: a chat UI, an LLM runtime, a tunneling service, a key manager.
 See [`docs/DESIGN.md § Non-goals`](docs/DESIGN.md#non-goals).
+
+## Install
+
+In your Solaigo cockpit: **AI connections → Pair a Companion**. It shows one command
+for your system with your pairing code already in it, for example:
+
+```sh
+curl -fsSL https://www.solaigo.com/cockpit/companion/install.sh | sh -s -- --code ABC-123
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://www.solaigo.com/cockpit/companion/install.ps1))) -Code ABC-123
+```
+
+The script picks the binary for your system and processor, checks it against the
+release's `SHA256SUMS`, pairs it, and runs `install`, which copies it somewhere stable
+and starts it now and at every login. No administrator rights are needed. A file
+fetched this way carries no "downloaded from the internet" mark, so neither Gatekeeper
+nor SmartScreen stops it — which is also why the binaries are not code-signed yet.
+Windows 11's Smart App Control, on the machines where it is switched on, can still
+refuse an unsigned program; signing is what would answer that.
+
+By hand: download the binary for your platform from the releases page, then
+
+```sh
+./solaigo-companion-<platform> pair --code ABC-123
+./solaigo-companion-<platform> install
+```
+
+`uninstall` removes the service; `logout` forgets the token on this machine.
 
 ## Build from source
 
@@ -28,37 +57,16 @@ Requires Go 1.27 or newer.
 ```sh
 make build          # produces ./solaigo-companion for the host OS
 make test           # runs the test suite
-make cross          # builds for linux-amd64, darwin-amd64, darwin-arm64, windows-amd64
+make cross          # linux, macOS, windows — amd64 and arm64 — plus SHA256SUMS
 make help           # lists every target
 ```
-
-## Try the scaffold
-
-```sh
-./solaigo-companion            # prints usage
-./solaigo-companion version    # prints the version string
-./solaigo-companion pair       # not implemented yet
-```
-
-## Pair with your Solaigo account
-
-Phase 2. For now:
-
-1. Build the binary with `make build`.
-2. In the Solaigo cockpit, under **Connexions**, you will click *Pair a Companion*
-   and see a short code. (This UI arrives in Phase 2 alongside the pairing endpoint.)
-3. `./solaigo-companion pair` will ask for the code and claim a long-lived token.
-4. The Companion stays connected and your local LLM appears as a connection in the
-   cockpit.
-
-Design (why) and protocol (how) are in [`docs/`](docs/).
 
 ## Repository layout
 
 ```
-cmd/companion/        The CLI entry point. The scaffold is here today.
-docs/                 DESIGN, PROTOCOL, and the backend-side plan for Phase 2.
-internal/             Phase 2: pair, transport, detect, proxy. Empty for now.
+cmd/companion/        The CLI: pair, status, logout, daemon, install, uninstall.
+docs/                 DESIGN, PROTOCOL, and the backend-side plan.
+internal/             claim, config, detect, proxy, transport.
 .github/workflows/    CI (build + test on Linux, macOS, Windows).
 ```
 

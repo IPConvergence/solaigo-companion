@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -119,4 +120,19 @@ func contains(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestInstallDirIsPerUserAndStable(t *testing.T) {
+	dir, err := InstallDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(dir), "downloads") {
+		t.Errorf("InstallDir = %q, which is where people tidy", dir)
+	}
+	home, _ := os.UserHomeDir()
+	local := os.Getenv("LOCALAPPDATA")
+	if !strings.HasPrefix(dir, home) && (local == "" || !strings.HasPrefix(dir, local)) {
+		t.Errorf("InstallDir = %q is not under the user's own directories", dir)
+	}
 }

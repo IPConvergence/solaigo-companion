@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/IPConvergence/solaigo-companion/internal/config"
+	"github.com/IPConvergence/solaigo-companion/internal/transport"
 )
 
 func TestVersionStringNotEmpty(t *testing.T) {
@@ -228,5 +231,25 @@ func TestPairPassesServerErrorMessageThrough(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not valid") {
 		t.Errorf("server message should be surfaced; got: %v", err)
+	}
+}
+
+// A refused or missing token must end the daemon with the status service managers
+// leave alone; a network failure must not. Exit 1 on a revoked token had launchd
+// restart it every ten seconds, indefinitely.
+func TestDaemonExitCodeDoesNotInviteARestartLoop(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"refused token", fmt.Errorf("could not open WebSocket: %w", errors.New("expected handshake response status code 101 but got 403")), 0},
+		{"not paired", transport.ErrNotPaired, 0},
+		{"network down", errors.New("dial tcp: connection refused"), 1},
+	}
+	for _, c := range cases {
+		if got := daemonExitCode(c.err); got != c.want {
+			t.Errorf("%s: exit %d, want %d", c.name, got, c.want)
+		}
 	}
 }

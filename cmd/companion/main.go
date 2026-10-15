@@ -92,7 +92,7 @@ func main() {
 	case "daemon":
 		if err := runDaemon(args, os.Stderr); err != nil {
 			fmt.Fprintln(os.Stderr, "daemon:", err)
-			os.Exit(1)
+			os.Exit(daemonExitCode(err))
 		}
 	case "install":
 		if err := runInstall(args, os.Stdout); err != nil {
@@ -245,6 +245,19 @@ func runLogout(args []string, in io.Reader, out io.Writer) error {
 	fmt.Fprintln(out, "Local token cleared.")
 	fmt.Fprintln(out, "The cockpit still shows this Companion until you remove it there.")
 	return nil
+}
+
+// daemonExitCode is what the daemon exits with when it stops. A refused token or no
+// token at all is final — only pairing again fixes it — so it exits 0, which is the
+// one status that launchd (KeepAlive, SuccessfulExit=false) and systemd
+// (Restart=on-failure) both leave alone. Exiting 1 had launchd restart a revoked
+// Companion every ten seconds, for good, each attempt refused by the cockpit.
+// Anything else is a failure worth restarting for.
+func daemonExitCode(err error) int {
+	if errors.Is(err, transport.ErrNotPaired) || transport.IsAuthFailure(err) {
+		return 0
+	}
+	return 1
 }
 
 func runDaemon(args []string, logOut io.Writer) error {

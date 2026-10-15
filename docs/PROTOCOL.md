@@ -93,6 +93,8 @@ policy grounds (e.g. the user's plan was downgraded between claim and connect).
 
 If the backend refuses the session, it sends a `bye` (see below) instead of `welcome`
 and closes the socket. The Companion then exits with a human message explaining why.
+A refused token (a `403` on the upgrade, or close code `1008`) exits with status **0**:
+only pairing again can fix it, and 0 is the status launchd and systemd do not restart.
 
 ## Inference frames
 
@@ -223,6 +225,11 @@ cancellation an exchange with an end state, which the backend accounting needs.
 ```json
 { "type": "inference.cancel", "request_id": "01HK3R..." }
 ```
+
+The backend also sends it when it gives up on a silent request: **150 s** before the
+first `inference.delta` (a local model may be loading and reading a prompt of several
+thousand tokens), then **90 s** between deltas. Without it the local model would go on
+writing an answer nobody reads, and hold the GPU while the next request waits.
 
 ## Housekeeping frames
 

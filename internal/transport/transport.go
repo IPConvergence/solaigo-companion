@@ -34,6 +34,12 @@ const Subprotocol = "solaigo.companion.v1"
 // stores it on the session row and shows it in the UI.
 const ProtocolVersion = "1.0.0"
 
+// The largest frame the Companion accepts. An inference request carries the
+// company's memory (up to 40 000 characters) and the thread's history (24 000), as
+// UTF-8 inside JSON. The library's default of 32 KiB was under that: a long turn
+// closed the socket with "message too big" and the answer never came.
+const MaxReadBytes = 4 << 20
+
 // How often the Companion sends an application-level ping. Mirrors the backend's
 // idle timeout (90s = 3 misses). The WS layer's own ping/pong keeps the TCP
 // alive; this one tells the server the Companion process is still responsive.
@@ -103,6 +109,7 @@ func Dial(ctx context.Context, token config.Token, companionVersion, hostname, o
 	if err != nil {
 		return nil, fmt.Errorf("could not open WebSocket to %s: %w", token.WSSURL, err)
 	}
+	conn.SetReadLimit(MaxReadBytes)
 
 	if detected == nil {
 		detected = []DetectedServer{}

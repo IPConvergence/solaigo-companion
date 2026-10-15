@@ -153,3 +153,35 @@ func TestSessionHandlesServerPing(t *testing.T) {
 		t.Errorf("Run should end on bye, got %v", err)
 	}
 }
+
+// An inference request carries the company's memory and the thread's history — tens
+// of kilobytes. The library's default read limit is 32 KiB, and a frame over it closed
+// the socket and lost the turn ("message too big: read limited at 32769 bytes").
+func TestSessionReadsAFrameLargerThanTheLibraryDefault(t *testing.T) {
+	big := strings.Repeat("é", 50_000) // 100 KB of UTF-8
+	wsURL, _, closeSrv := fakeCockpit(t, func(ctx context.Context, conn *websocket.Conn) {
+		if err := wsjson.Write(ctx, conn, map[string]any{"type": "ping", "t": 7, "pad": big}); err != nil {
+			return
+		}
+		var reply map[string]any
+		if err := wsjson.Read(ctx, conn, &reply); err != nil {
+			t.Errorf("no pong after a large frame: %v", err)
+			return
+		}
+		_ = wsjson.Write(ctx, conn, map[string]any{"type": "bye", "code": "shutdown", "message": "test done"})
+	})
+	defer closeSrv()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	session, err := Dial(ctx, config.Token{Token: "good-token", WSSURL: wsURL},
+		"0.3.0-test", "test-host", "linux", "amd64", nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	err = session.Run(ctx, nil)
+	if err == nil || !strings.Contains(err.Error(), "bye") {
+		t.Errorf("Run should end on bye, got %v", err)
+	}
+}

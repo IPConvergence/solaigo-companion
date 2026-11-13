@@ -62,6 +62,9 @@ type Hello struct {
 type DetectedServer struct {
 	Server string   `json:"server"`
 	Models []string `json:"models"`
+	// The context window each model last ran with, when the server reports it
+	// (docs/PROTOCOL.md § hello). Omitted when unknown.
+	Context map[string]int `json:"context,omitempty"`
 }
 
 // Welcome is what the backend returns in response to Hello, when it accepts.

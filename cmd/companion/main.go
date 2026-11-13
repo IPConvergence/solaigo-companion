@@ -309,7 +309,7 @@ func discoverLocal() []transport.DetectedServer {
 	servers := detect.All(context.Background())
 	out := make([]transport.DetectedServer, 0, len(servers))
 	for _, s := range servers {
-		out = append(out, transport.DetectedServer{Server: s.Server, Models: s.Models})
+		out = append(out, transport.DetectedServer{Server: s.Server, Models: s.Models, Context: s.Context})
 	}
 	return out
 }

@@ -53,7 +53,11 @@ Sent by Companion as its first frame. Advertises what it can do.
   "arch": "amd64",
   "hostname": "marcs-laptop",
   "detected": [
-    { "server": "ollama", "models": ["llama3.2:latest", "qwen2.5:7b"] }
+    {
+      "server": "ollama",
+      "models": ["llama3.2:latest", "qwen2.5:7b"],
+      "context": { "llama3.2:latest": 4096 }
+    }
   ]
 }
 ```
@@ -67,6 +71,13 @@ Sent by Companion as its first frame. Advertises what it can do.
 - `detected`: zero or more local servers found. Each entry has a `server` tag
   (`ollama`, `lmstudio`, `llamacpp`, `vllm`) and the `models` the server reports.
   Empty means no model is available right now, but the Companion is still connected.
+- `detected[*].context` (optional, since 0.5.2): the context window, in tokens, each
+  model last ran with, as Ollama's `/api/ps` reports it for a loaded model — kept after
+  the model unloads. Absent until a model has been loaded once. The cockpit warns on
+  the connection when it is under 16 384: Ollama drops the *start* of a request that
+  does not fit, which is the agent's instructions and the founder's memory, and says
+  nothing. `/v1/chat/completions` ignores `num_ctx`, so the window can only be changed
+  on the server (`OLLAMA_CONTEXT_LENGTH`), which is what the cockpit tells the founder.
 
 ### `welcome` (backend → Companion)
 

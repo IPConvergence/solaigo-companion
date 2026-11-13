@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -25,6 +26,14 @@ type Server struct {
 	// returned; the rest arrive by adding entries to All.
 	Server string   `json:"server"`
 	Models []string `json:"models"`
+	// Context is the context window, in tokens, each model last ran with — what
+	// Ollama's /api/ps reports for a loaded model. A model is listed there only
+	// while it is loaded, so the last value seen is kept for the life of the
+	// process. The cockpit warns when it is too small for a Solaigo turn: Ollama
+	// drops the start of a request that does not fit, which is the agent's
+	// instructions and the founder's memory, without an error. Absent when no
+	// model has been loaded yet, or on a server that does not report it.
+	Context map[string]int `json:"context,omitempty"`
 }
 
 // All probes every known local LLM server once and returns everything that
@@ -39,8 +48,75 @@ func All(ctx context.Context) []Server {
 	defer cancel()
 
 	var out []Server
-	if server, ok := probeOllama(probeCtx); ok {
+	if server, ok := probeOllama(probeCtx, ollamaBase); ok {
+		server.Context = remember(server.Server, probeLoaded(probeCtx, ollamaBase))
 		out = append(out, server)
+	}
+	return out
+}
+
+const ollamaBase = "http://127.0.0.1:11434"
+
+// seen keeps the last context window reported for each model, per server, so a
+// model that Ollama unloaded after its keep-alive still has its window known.
+var (
+	seenMu sync.Mutex
+	seen   = map[string]map[string]int{}
+)
+
+// remember merges what is loaded now into what was seen before and returns a
+// copy of the result, or nil when nothing has been seen yet.
+func remember(server string, loaded map[string]int) map[string]int {
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	known := seen[server]
+	if known == nil {
+		known = map[string]int{}
+		seen[server] = known
+	}
+	for model, n := range loaded {
+		known[model] = n
+	}
+	if len(known) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(known))
+	for model, n := range known {
+		out[model] = n
+	}
+	return out
+}
+
+// probeLoaded asks Ollama's /api/ps which models are loaded and with what
+// context window. Best effort: an Ollama too old to report context_length, or
+// one that does not answer, gives an empty map rather than an error.
+func probeLoaded(ctx context.Context, base string) map[string]int {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/ps", nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	var body struct {
+		Models []struct {
+			Name          string `json:"name"`
+			ContextLength int    `json:"context_length"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil
+	}
+	out := map[string]int{}
+	for _, m := range body.Models {
+		if m.Name != "" && m.ContextLength > 0 {
+			out[m.Name] = m.ContextLength
+		}
 	}
 	return out
 }
@@ -49,9 +125,8 @@ func All(ctx context.Context) []Server {
 // models. Ollama has shipped an OpenAI-compatible /v1 shim since 0.1.17, so
 // the inference proxy talks /v1/chat/completions to it later; /api/tags is
 // just the model inventory, which is simpler and has been stable longer.
-func probeOllama(ctx context.Context) (Server, bool) {
-	const url = "http://127.0.0.1:11434/api/tags"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func probeOllama(ctx context.Context, base string) (Server, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/tags", nil)
 	if err != nil {
 		return Server{}, false
 	}
@@ -87,7 +162,7 @@ func probeOllama(ctx context.Context) (Server, bool) {
 func BaseURL(serverName string) string {
 	switch serverName {
 	case "ollama":
-		return "http://127.0.0.1:11434"
+		return ollamaBase
 	}
 	return ""
 }
